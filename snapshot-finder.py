@@ -89,6 +89,9 @@ DISCARDED_BY_TIMEOUT = 0
 FULL_LOCAL_SNAPSHOTS = []
 # skip servers that do not fit the filters so as not to check them again
 unsuitable_servers = set()
+# track the fastest RPC node we've seen so far across attempts
+FASTEST_RPC_NODE = None
+FASTEST_SPEED_BYTES = 0
 # Configure Logging
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 if args.verbose:
@@ -483,6 +486,7 @@ def main_worker():
 
         best_snapshot_node = {}
         num_of_rpc_to_check = 15
+        global FASTEST_RPC_NODE, FASTEST_SPEED_BYTES
 
         rpc_nodes_inc_sorted = []
         logger.info("TRYING TO DOWNLOADING FILES")
@@ -503,6 +507,9 @@ def main_worker():
 
             down_speed_bytes = measure_speed(url=rpc_node["snapshot_address"], measure_time=SPEED_MEASURE_TIME_SEC)
             down_speed_mb = convert_size(down_speed_bytes)
+            if down_speed_bytes > FASTEST_SPEED_BYTES:
+                FASTEST_SPEED_BYTES = down_speed_bytes
+                FASTEST_RPC_NODE = rpc_node
             if down_speed_bytes < MIN_DOWNLOAD_SPEED_MB * 1e6:
                 logger.info(f'Too slow: {down_speed_mb}')
                 unsuitable_servers.add(rpc_node["snapshot_address"])
@@ -542,9 +549,6 @@ def main_worker():
             logger.error(f'No snapshot nodes were found matching the given parameters:{args.min_download_speed=}'
                   f'\nTry restarting the script with --with_private_rpc'
                   f'RETRY #{NUM_OF_ATTEMPTS}\\{NUM_OF_MAX_ATTEMPTS}')
-            return 1
-
-
 
     except KeyboardInterrupt:
         sys.exit('\nKeyboardInterrupt - ctrl + c')
@@ -611,8 +615,34 @@ while NUM_OF_ATTEMPTS <= NUM_OF_MAX_ATTEMPTS:
         WITH_PRIVATE_RPC = True
 
     if NUM_OF_ATTEMPTS >= NUM_OF_MAX_ATTEMPTS:
-        logger.error(f'Could not find a suitable snapshot --> exit')
-        sys.exit()
+        if FASTEST_RPC_NODE is not None:
+            logger.warning(
+                'No snapshot nodes met the minimum speed requirement. '
+                f'Using the fastest available node at {convert_size(FASTEST_SPEED_BYTES)} /s '
+                f"{FASTEST_RPC_NODE['snapshot_address']}"
+            )
+            for path in reversed(FASTEST_RPC_NODE["files_to_download"]):
+                if str(path).startswith("/snapshot-"):
+                    full_snap_slot__ = path.split("-")[1]
+                    if full_snap_slot__ == FULL_LOCAL_SNAP_SLOT:
+                        continue
+
+                if 'incremental' in path:
+                    r = do_request(
+                        f'http://{FASTEST_RPC_NODE["snapshot_address"]}/incremental-snapshot.tar.bz2',
+                        method_='head', timeout_=2)
+                    if 'location' in str(r.headers) and 'error' not in str(r.text):
+                        best_snapshot_node = f'http://{FASTEST_RPC_NODE["snapshot_address"]}{r.headers["location"]}'
+                    else:
+                        best_snapshot_node = f'http://{FASTEST_RPC_NODE["snapshot_address"]}{path}'
+                else:
+                    best_snapshot_node = f'http://{FASTEST_RPC_NODE["snapshot_address"]}{path}'
+                logger.info(f'Downloading {best_snapshot_node} snapshot to {SNAPSHOT_PATH}')
+                download(url=best_snapshot_node)
+            sys.exit(0)
+        else:
+            logger.error(f'Could not find a suitable snapshot --> exit')
+            sys.exit()
 
     logger.info(f"Sleeping {SLEEP_BEFORE_RETRY} seconds before next try")
     time.sleep(SLEEP_BEFORE_RETRY)
